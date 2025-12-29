@@ -13,12 +13,11 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator
 
 from backend import Backend
 
-
 APP_ID = "com.spooky.ragnok.tray"
 ICON_URL = "https://cdn.4fingerstudios.com/gun.png"
 ICON_CACHE = "/tmp/ragnok_mouse.png"
 
-SPEED_PRESETS = [
+DPI_PRESETS = [
     ("Slow", 1200),
     ("Normal", 2400),
     ("Fast", 6400),
@@ -54,7 +53,12 @@ class TrayApp:
         self.menu = Gtk.Menu()
         self.indicator.set_menu(self.menu)
 
-        self._polling_radio_items = {}  # hz -> Gtk.RadioMenuItem
+        self._suppress_toggle_events = False
+
+        # handles to check items so we can sync UI state without rebuilding menu
+        self._ripple_item = None
+        self._angle_item = None
+        self._motion_item = None
 
         self._build_menu()
 
@@ -65,15 +69,14 @@ class TrayApp:
 
     def _build_menu(self):
         self.menu.foreach(lambda w: self.menu.remove(w))
-        self._polling_radio_items.clear()
 
         # DPI submenu
         dpi_root = Gtk.MenuItem(label="DPI")
         dpi_menu = Gtk.Menu()
         dpi_root.set_submenu(dpi_menu)
-        for name, dpi in SPEED_PRESETS:
+        for name, dpi in DPI_PRESETS:
             item = Gtk.MenuItem(label=f"{name} ({dpi})")
-            item.connect("activate", lambda _, d=dpi: self.backend.set_dpi_async(d, lambda *_: None))
+            item.connect("activate", lambda _, d=dpi: self._set_dpi(d))
             dpi_menu.append(item)
         self.menu.append(dpi_root)
 
@@ -92,30 +95,37 @@ class TrayApp:
 
         self.menu.append(led_root)
 
-        # Polling submenu (NEW)
+        # Polling submenu
         poll_root = Gtk.MenuItem(label="Polling Rate")
         poll_menu = Gtk.Menu()
         poll_root.set_submenu(poll_menu)
-
-        group = None
         for label, hz in POLLING_PRESETS:
-            item = Gtk.RadioMenuItem.new_with_label(group, label)
-            group = item.get_group()
-            self._polling_radio_items[hz] = item
-
-            def on_polling_activate(w, rate_hz=hz):
-                # Only react when becoming active
-                if isinstance(w, Gtk.RadioMenuItem) and not w.get_active():
-                    return
-                self.backend.set_polling_rate_async(rate_hz, lambda *_: None)
-
-            item.connect("activate", on_polling_activate)
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda _, h=hz: self._set_polling(h))
             poll_menu.append(item)
-
         self.menu.append(poll_root)
 
-        # Quit
+        # Feature toggles submenu
+        feat_root = Gtk.MenuItem(label="Toggles")
+        feat_menu = Gtk.Menu()
+        feat_root.set_submenu(feat_menu)
+
+        self._ripple_item = Gtk.CheckMenuItem(label="Ripple Control")
+        self._ripple_item.connect("toggled", self._on_toggle_ripple)
+        feat_menu.append(self._ripple_item)
+
+        self._angle_item = Gtk.CheckMenuItem(label="Angle Snap")
+        self._angle_item.connect("toggled", self._on_toggle_angle)
+        feat_menu.append(self._angle_item)
+
+        self._motion_item = Gtk.CheckMenuItem(label="Motion Sync")
+        self._motion_item.connect("toggled", self._on_toggle_motion)
+        feat_menu.append(self._motion_item)
+
+        self.menu.append(feat_root)
+
         self.menu.append(Gtk.SeparatorMenuItem())
+
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", Gtk.main_quit)
         self.menu.append(quit_item)
@@ -123,6 +133,18 @@ class TrayApp:
         self.menu.show_all()
 
     # --------------------------------------------------------
+    # Actions
+    # --------------------------------------------------------
+
+    def _set_dpi(self, dpi: int):
+        if not self.backend.auto_connect():
+            return
+        self.backend.set_dpi_async(dpi, lambda _: None)
+
+    def _set_polling(self, hz: int):
+        if not self.backend.auto_connect():
+            return
+        self.backend.set_polling_rate_async(hz, lambda _: None)
 
     def _led_dialog(self, title, is_brightness):
         dialog = Gtk.Dialog(title=title, flags=Gtk.DialogFlags.MODAL)
@@ -143,12 +165,70 @@ class TrayApp:
         dialog.show_all()
         if dialog.run() == Gtk.ResponseType.OK:
             val = int(scale.get_value())
+            if not self.backend.auto_connect():
+                dialog.destroy()
+                return
             if is_brightness:
-                self.backend.set_led_async(val, 0, lambda *_: None)   # brightness only
+                self.backend.set_led_async(val, 0, lambda _: None)   # brightness only
             else:
-                self.backend.set_led_async(0, val, lambda *_: None)   # speed only
+                self.backend.set_led_async(0, val, lambda _: None)   # speed only
         dialog.destroy()
 
+    # --------------------------------------------------------
+    # Toggle handlers (with revert-on-failure)
+    # --------------------------------------------------------
+
+    def _set_check_safely(self, item: Gtk.CheckMenuItem, value: bool):
+        self._suppress_toggle_events = True
+        try:
+            item.set_active(value)
+        finally:
+            self._suppress_toggle_events = False
+
+    def _on_toggle_ripple(self, item: Gtk.CheckMenuItem):
+        if self._suppress_toggle_events:
+            return
+        desired = item.get_active()
+        if not self.backend.auto_connect():
+            self._set_check_safely(item, not desired)
+            return
+
+        def done(ok: bool):
+            if not ok:
+                self._set_check_safely(item, not desired)
+
+        self.backend.set_ripple_control_async(desired, done)
+
+    def _on_toggle_angle(self, item: Gtk.CheckMenuItem):
+        if self._suppress_toggle_events:
+            return
+        desired = item.get_active()
+        if not self.backend.auto_connect():
+            self._set_check_safely(item, not desired)
+            return
+
+        def done(ok: bool):
+            if not ok:
+                self._set_check_safely(item, not desired)
+
+        self.backend.set_angle_snap_async(desired, done)
+
+    def _on_toggle_motion(self, item: Gtk.CheckMenuItem):
+        if self._suppress_toggle_events:
+            return
+        desired = item.get_active()
+        if not self.backend.auto_connect():
+            self._set_check_safely(item, not desired)
+            return
+
+        def done(ok: bool):
+            if not ok:
+                self._set_check_safely(item, not desired)
+
+        self.backend.set_motion_sync_async(desired, done)
+
+    # --------------------------------------------------------
+    # Polling reads (tick) + UI refresh
     # --------------------------------------------------------
 
     def tick(self):
@@ -159,27 +239,30 @@ class TrayApp:
             try:
                 self.backend.read_battery()
                 self.backend.read_current_dpi()
-
-                # NEW: try read polling rate (if it fails, we just keep last known)
                 self.backend.read_polling_rate()
+                self.backend.read_toggles()
             except Exception:
                 self.backend.disconnect()
 
         threading.Thread(target=worker, daemon=True).start()
         return True
 
-    # --------------------------------------------------------
-
     def refresh(self):
+        # Sync toggle UI state to backend state (don’t fire callbacks)
+        if self._ripple_item:
+            self._set_check_safely(self._ripple_item, self.backend.ripple_control)
+        if self._angle_item:
+            self._set_check_safely(self._angle_item, self.backend.angle_snap)
+        if self._motion_item:
+            self._set_check_safely(self._motion_item, self.backend.motion_sync)
+
         if self.backend.dev:
             if self.backend.is_sleeping():
                 self.indicator.set_label("Sleeping", "")
             else:
-                poll = ""
-                if self.backend.polling_hz > 0:
-                    poll = f" @ {self.backend.polling_hz}Hz"
+                poll = f"{self.backend.polling_hz} Hz" if self.backend.polling_hz > 0 else "?"
                 self.indicator.set_label(
-                    f"{self.backend.dpi_value} DPI{poll} | 🔋 {self.backend.battery_percent}%",
+                    f"{self.backend.dpi_value} DPI | {poll} | 🔋 {self.backend.battery_percent}%",
                     ""
                 )
         else:
