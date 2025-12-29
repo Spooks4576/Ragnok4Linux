@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import os
@@ -14,11 +13,6 @@ gi.require_version("GLib", "2.0")
 gi.require_version("GObject", "2.0")
 from gi.repository import GLib, GObject
 
-
-# ============================================================
-# Checksums / framing
-# ============================================================
-
 def checksum_0x55(data: bytes) -> int:
     """0x55 - (sum(data) mod 256)"""
     return (0x55 - (sum(data) & 0xFF)) & 0xFF
@@ -28,11 +22,6 @@ def pack17(payload16: bytes) -> bytes:
     if len(payload16) != 16:
         raise ValueError("payload16 must be exactly 16 bytes")
     return payload16 + bytes([checksum_0x55(payload16)])
-
-
-# ============================================================
-# HID raw discovery
-# ============================================================
 
 @dataclass
 class HidrawInfo:
@@ -52,11 +41,6 @@ def list_hidraw() -> List[HidrawInfo]:
             pass
         out.append(HidrawInfo(p, name))
     return out
-
-
-# ============================================================
-# hidraw I/O
-# ============================================================
 
 class HidDevice:
     def __init__(self, path: str):
@@ -84,7 +68,6 @@ class HidDevice:
         if len(data) < 17:
             return None
 
-        # scan for valid 17-byte frames
         for i in range(0, len(data) - 17 + 1):
             pkt = data[i:i+17]
             if checksum_0x55(pkt[:16]) == pkt[16]:
@@ -107,11 +90,6 @@ class HidDevice:
                     return pkt
         return None
 
-
-# ============================================================
-# Commands
-# ============================================================
-
 def cmd_read_battery() -> bytes:
     return pack17(bytes([0x08, 0x04] + [0x00] * 14))
 
@@ -126,7 +104,7 @@ def cmd_read_flash(addr: int, count: int) -> bytes:
 
 def cmd_write_0807_checked(addr: int, data: bytes) -> bytes:
     """
-    Checked write style (your original cmd_write_0807):
+    Checked write style:
       count = len(data) + 1
       payload includes trailing checksum_0x55(data)
     data length must be <= 9.
@@ -162,12 +140,6 @@ def cmd_write_0807_raw(addr: int, data: bytes) -> bytes:
     p[6:6+len(data)] = data
     return pack17(bytes(p))
 
-
-# ============================================================
-# Registers / addresses
-# ============================================================
-
-# DPI (kept intact)
 DPI_LEVEL_SELECT_ADDR = 0x0004
 DPI_LEVEL_BASE_ADDR   = 0x000C
 DPI_LEVEL_STRIDE      = 0x0004
@@ -176,22 +148,18 @@ DPI_LEVEL_COUNT       = 5
 def dpi_to_raw(dpi: int) -> int:
     return max(1, min(255, int(round(dpi / 100))))
 
-# Polling rate
 POLLING_RATE_ADDR = 0x0000
 POLLING_CODE_TO_HZ = {1: 125, 2: 250, 3: 500, 4: 1000}
 POLLING_HZ_TO_CODE = {v: k for k, v in POLLING_CODE_TO_HZ.items()}
 
-# Toggles
-# (These are the addresses you were using in your build)
 MOTION_SYNC_ADDR    = 0x00AB
 ANGLE_SNAP_ADDR     = 0x00AF
 RIPPLE_CONTROL_ADDR = 0x00B1
 
-# LED
-LED_CONFIG_ADDR = 0x00A0  # read 10; first 6 are [mode,R,G,B,speed,brightness]
-LED_APPLY_ADDR  = 0x00A7  # write [0x01] (checked) to apply
+LED_CONFIG_ADDR = 0x00A0  
 
-# Macro binding + storage
+LED_APPLY_ADDR  = 0x00A7  
+
 BUTTON_MAP_ADDR  = 0x0070
 BTN4_BIND_DATA   = bytes([0x06, 0x04, 0x01])
 BTN4_UNBIND_DATA = bytes([0x06, 0x04, 0xFE])
@@ -199,26 +167,19 @@ BTN4_UNBIND_DATA = bytes([0x06, 0x04, 0xFE])
 MACRO_SLOT0_ADDR = 0x0900
 MACRO_RECORD_LEN = 384
 
-
-# ============================================================
-# HID keyboard mapping (US) for string macros
-# ============================================================
-
-# modifier 0x02 = Left Shift
 HID_KEYS: Dict[str, Tuple[int, int]] = {
-    # letters
+
     **{chr(ord('a')+i): (0x04+i, 0x00) for i in range(26)},
-    # digits
+
     "1": (0x1E, 0x00), "2": (0x1F, 0x00), "3": (0x20, 0x00), "4": (0x21, 0x00),
     "5": (0x22, 0x00), "6": (0x23, 0x00), "7": (0x24, 0x00), "8": (0x25, 0x00),
     "9": (0x26, 0x00), "0": (0x27, 0x00),
 
-    # whitespace / control
     " ":  (0x2C, 0x00),
-    "\n": (0x28, 0x00),   # Enter
-    "\t": (0x2B, 0x00),   # Tab
+    "\n": (0x28, 0x00),   
 
-    # punctuation (unshifted)
+    "\t": (0x2B, 0x00),   
+
     "-": (0x2D, 0x00),
     "=": (0x2E, 0x00),
     "[": (0x2F, 0x00),
@@ -231,7 +192,6 @@ HID_KEYS: Dict[str, Tuple[int, int]] = {
     ".": (0x37, 0x00),
     "/": (0x38, 0x00),
 
-    # shifted variants
     "!": (0x1E, 0x02),
     "@": (0x1F, 0x02),
     "#": (0x20, 0x02),
@@ -272,11 +232,6 @@ def hid_keycode_for_char(ch: str) -> Optional[Tuple[int, int]]:
 
     return HID_KEYS.get(ch)
 
-
-# ============================================================
-# Macro record builder (string macros)
-# ============================================================
-
 def build_macro_string_record(
     *,
     name: str,
@@ -298,9 +253,8 @@ def build_macro_string_record(
             continue
         keycode, modifier = kc
 
-        # press
         events.append((0x80, keycode, modifier, press_delay_ms))
-        # release (+ inter delay except last)
+
         delay_after = inter_key_delay_ms if idx < (len(text) - 1) else 0
         events.append((0x40, keycode, modifier, delay_after))
 
@@ -330,11 +284,6 @@ def build_macro_string_record(
 
     return bytes(buf)
 
-
-# ============================================================
-# Backend
-# ============================================================
-
 class Backend(GObject.Object):
     SLEEP_TIMEOUT = 5.0
 
@@ -355,18 +304,15 @@ class Backend(GObject.Object):
         self.led_r = 0
         self.led_g = 0
         self.led_b = 0
-        self.led_speed = 0          # 1..10 UI
-        self.led_brightness = 0     # 1..10 UI
+        self.led_speed = 0          
+
+        self.led_brightness = 0     
 
         self.btn4_macro_bound = False
 
         self.last_rx_time = 0.0
 
         self.refresh_devices()
-
-    # --------------------------------------------------------
-    # Device lifecycle
-    # --------------------------------------------------------
 
     def refresh_devices(self):
         self.devices = [{"path": d.path, "name": d.name} for d in list_hidraw()]
@@ -402,10 +348,6 @@ class Backend(GObject.Object):
             raise IOError("device not connected")
         return self.dev
 
-    # --------------------------------------------------------
-    # Low-level read/write helpers
-    # --------------------------------------------------------
-
     def read_flash(self, addr: int, count: int) -> Optional[bytes]:
         dev = self._require_dev()
         rx = dev.transceive_expect(cmd_read_flash(addr, count), 0x08, 0.40)
@@ -429,10 +371,6 @@ class Backend(GObject.Object):
             return False
         self.last_rx_time = time.monotonic()
         return True
-
-    # --------------------------------------------------------
-    # Reads
-    # --------------------------------------------------------
 
     def read_battery(self) -> bool:
         dev = self._require_dev()
@@ -508,10 +446,6 @@ class Backend(GObject.Object):
         self.btn4_macro_bound = (b[0] == 0x06 and b[1] == 0x04 and b[2] == 0x01)
         return True
 
-    # --------------------------------------------------------
-    # Writes (async)
-    # --------------------------------------------------------
-
     def set_dpi_async(self, dpi: int, on_done: Callable[[bool], None]):
         def worker():
             try:
@@ -572,7 +506,7 @@ class Backend(GObject.Object):
                 if not cfg_full:
                     raise IOError("read led config failed")
 
-                cfg = bytearray(cfg_full[:6])  # [mode,r,g,b,speed,brightness]
+                cfg = bytearray(cfg_full[:6])  
 
                 if speed_1_10 != 0:
                     cfg[4] = max(0, min(9, int(speed_1_10) - 1))
@@ -604,7 +538,8 @@ class Backend(GObject.Object):
                 if not cfg_full:
                     raise IOError("read led config failed")
 
-                cfg = bytearray(cfg_full[:6])  # [mode,r,g,b,speed,brightness]
+                cfg = bytearray(cfg_full[:6])  
+
                 mode = max(1, min(5, int(mode_1_5)))
                 cfg[0] = mode
 
@@ -629,10 +564,6 @@ class Backend(GObject.Object):
                 GLib.idle_add(on_done, False)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    # --------------------------------------------------------
-    # Macro: Button 4 dedicated
-    # --------------------------------------------------------
 
     def bind_btn4_to_macro_async(self, on_done: Callable[[bool], None]):
         def worker():
@@ -688,7 +619,7 @@ class Backend(GObject.Object):
                         raise IOError(f"macro write failed at 0x{addr:04X}")
                     addr += len(chunk)
                     i += len(chunk)
-                    time.sleep(0.02)  # flash pacing
+                    time.sleep(0.02)  
 
                 if not self._write_checked(BUTTON_MAP_ADDR, BTN4_BIND_DATA, timeout=0.50):
                     raise IOError("bind failed")
@@ -701,4 +632,3 @@ class Backend(GObject.Object):
                 GLib.idle_add(on_done, False)
 
         threading.Thread(target=worker, daemon=True).start()
-
