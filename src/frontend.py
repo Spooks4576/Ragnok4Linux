@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import threading
 import urllib.request
@@ -12,7 +11,6 @@ from gi.repository import Gtk, GLib, Notify
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
 
 from backend import Backend
-
 
 APP_ID = "com.spooky.ragnok.tray"
 ICON_URL = "https://cdn.4fingerstudios.com/gun.png"
@@ -40,7 +38,6 @@ LED_MODES = [
     ("Mode 5", 5),
 ]
 
-
 def ensure_icon():
     if not os.path.exists(ICON_CACHE):
         try:
@@ -48,7 +45,6 @@ def ensure_icon():
         except Exception:
             return "input-mouse"
     return ICON_CACHE
-
 
 class TrayApp:
     def __init__(self):
@@ -65,9 +61,10 @@ class TrayApp:
         self.menu = Gtk.Menu()
         self.indicator.set_menu(self.menu)
 
-        # Keep references to items we need to update
-        self.polling_radio_items = {}   # hz -> Gtk.RadioMenuItem
-        self.led_mode_radio_items = {}  # mode -> Gtk.RadioMenuItem
+        self.polling_radio_items = {}   
+
+        self.led_mode_radio_items = {}  
+
         self.item_led_custom_color = None
 
         self.chk_ripple = None
@@ -81,14 +78,9 @@ class TrayApp:
         GLib.timeout_add(500, self.refresh)
         GLib.timeout_add(2000, self.tick)
 
-    # --------------------------------------------------------
-
     def _build_menu(self):
         self.menu.foreach(lambda w: self.menu.remove(w))
 
-        # -------------------------
-        # DPI
-        # -------------------------
         dpi_root = Gtk.MenuItem(label="DPI")
         dpi_menu = Gtk.Menu()
         dpi_root.set_submenu(dpi_menu)
@@ -98,9 +90,6 @@ class TrayApp:
             dpi_menu.append(item)
         self.menu.append(dpi_root)
 
-        # -------------------------
-        # Performance (Polling Rate)
-        # -------------------------
         perf_root = Gtk.MenuItem(label="Performance")
         perf_menu = Gtk.Menu()
         perf_root.set_submenu(perf_menu)
@@ -126,9 +115,6 @@ class TrayApp:
         perf_menu.append(polling_root)
         self.menu.append(perf_root)
 
-        # -------------------------
-        # Toggles
-        # -------------------------
         togg_root = Gtk.MenuItem(label="Toggles")
         togg_menu = Gtk.Menu()
         togg_root.set_submenu(togg_menu)
@@ -147,14 +133,10 @@ class TrayApp:
 
         self.menu.append(togg_root)
 
-        # -------------------------
-        # LED
-        # -------------------------
         led_root = Gtk.MenuItem(label="LED")
         led_menu = Gtk.Menu()
         led_root.set_submenu(led_menu)
 
-        # Mode radios
         mode_root = Gtk.MenuItem(label="Mode")
         mode_menu = Gtk.Menu()
         mode_root.set_submenu(mode_menu)
@@ -175,7 +157,6 @@ class TrayApp:
 
         led_menu.append(mode_root)
 
-        # Custom color (only active on mode 2)
         self.item_led_custom_color = Gtk.MenuItem(label="Custom RGB Color…")
         self.item_led_custom_color.connect("activate", lambda *_: self._led_color_dialog())
         led_menu.append(self.item_led_custom_color)
@@ -192,9 +173,6 @@ class TrayApp:
 
         self.menu.append(led_root)
 
-        # -------------------------
-        # Macros (Button 4 dedicated)
-        # -------------------------
         macro_root = Gtk.MenuItem(label="Macros")
         macro_menu = Gtk.Menu()
         macro_root.set_submenu(macro_menu)
@@ -219,19 +197,12 @@ class TrayApp:
 
         self.menu.append(macro_root)
 
-        # -------------------------
-        # Quit
-        # -------------------------
         self.menu.append(Gtk.SeparatorMenuItem())
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", Gtk.main_quit)
         self.menu.append(quit_item)
 
         self.menu.show_all()
-
-    # --------------------------------------------------------
-    # Callbacks
-    # --------------------------------------------------------
 
     def _on_polling_toggled(self, item: Gtk.RadioMenuItem, hz: int):
         if self._updating_menu:
@@ -248,8 +219,7 @@ class TrayApp:
         if self._updating_menu:
             return
         if item.get_active():
-            # If user selects a mode, apply it immediately.
-            # For mode 2, keep current RGB; for others ignore RGB.
+
             rgb = None
             if mode == 2:
                 rgb = (self.backend.led_r, self.backend.led_g, self.backend.led_b)
@@ -263,10 +233,6 @@ class TrayApp:
         else:
             self.backend.unbind_btn4_macro_async(lambda *_: None)
 
-    # --------------------------------------------------------
-    # Dialogs
-    # --------------------------------------------------------
-
     def _led_slider_dialog(self, title: str, is_brightness: bool):
         dialog = Gtk.Dialog(title=title, flags=Gtk.DialogFlags.MODAL)
         dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
@@ -277,7 +243,6 @@ class TrayApp:
         scale.set_digits(0)
         scale.set_hexpand(True)
 
-        # preload
         scale.set_value(self.backend.led_brightness if is_brightness else self.backend.led_speed)
 
         box = dialog.get_content_area()
@@ -295,7 +260,7 @@ class TrayApp:
         dialog.destroy()
 
     def _led_color_dialog(self):
-        # Only meaningful in mode 2
+
         if self.backend.led_mode != 2:
             return
 
@@ -329,9 +294,6 @@ class TrayApp:
         box.set_margin_start(12)
         box.set_margin_end(12)
 
-        # -------------------------
-        # Macro text input
-        # -------------------------
         box.add(Gtk.Label(label="Macro Text (typed exactly):"))
 
         textview = Gtk.TextView()
@@ -345,9 +307,6 @@ class TrayApp:
 
         box.add(scroll)
 
-        # -------------------------
-        # Timing controls
-        # -------------------------
         timing_grid = Gtk.Grid(column_spacing=10, row_spacing=6)
 
         lbl_press = Gtk.Label(label="Press Delay (ms):", halign=Gtk.Align.START)
@@ -367,9 +326,6 @@ class TrayApp:
 
         box.add(timing_grid)
 
-        # -------------------------
-        # Status / limits
-        # -------------------------
         lbl_status = Gtk.Label(label="0 characters (0 / 70 events)")
         lbl_status.set_xalign(0.0)
         box.add(lbl_status)
@@ -389,9 +345,6 @@ class TrayApp:
 
         dialog.show_all()
 
-        # -------------------------
-        # Handle Save
-        # -------------------------
         if dialog.run() == Gtk.ResponseType.OK:
             buf = textview.get_buffer()
             start, end = buf.get_bounds()
@@ -412,7 +365,7 @@ class TrayApp:
                     None,
                 )
                 n.show()
-                
+
             if not self.backend.auto_connect():
                 Notify.Notification.new(
                     "Macro",
@@ -422,7 +375,6 @@ class TrayApp:
                 dialog.destroy()
                 return
 
-            # Call backend
             self.backend.program_btn4_macro_string_async(
                 text=text,
                 press_delay_ms=press_delay,
@@ -431,7 +383,6 @@ class TrayApp:
             )
 
         dialog.destroy()
-
 
     def _macro_read_info(self):
         if not self.backend.auto_connect():
@@ -459,8 +410,6 @@ class TrayApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # --------------------------------------------------------
-
     def _rgb_to_rgba(self, r: int, g: int, b: int):
         rgba = Gtk.gdk.RGBA()
         rgba.red = max(0.0, min(1.0, r / 255.0))
@@ -468,10 +417,6 @@ class TrayApp:
         rgba.blue = max(0.0, min(1.0, b / 255.0))
         rgba.alpha = 1.0
         return rgba
-
-    # --------------------------------------------------------
-    # Polling tick / UI refresh
-    # --------------------------------------------------------
 
     def tick(self):
         if not self.backend.auto_connect():
@@ -492,7 +437,7 @@ class TrayApp:
         return True
 
     def refresh(self):
-        # Update indicator label
+
         if self.backend.dev:
             if self.backend.is_sleeping():
                 self.indicator.set_label("Sleeping", "")
@@ -505,14 +450,12 @@ class TrayApp:
         else:
             self.indicator.set_label("Disconnected", "")
 
-        # Update menu state without triggering callbacks
         self._updating_menu = True
         try:
-            # Polling radios
+
             if self.backend.polling_hz in self.polling_radio_items:
                 self.polling_radio_items[self.backend.polling_hz].set_active(True)
 
-            # Toggle checks
             if self.chk_ripple:
                 self.chk_ripple.set_active(bool(self.backend.ripple_control))
             if self.chk_angle:
@@ -520,13 +463,11 @@ class TrayApp:
             if self.chk_motion:
                 self.chk_motion.set_active(bool(self.backend.motion_sync))
 
-            # LED mode radios + custom color sensitivity
             if self.backend.led_mode in self.led_mode_radio_items:
                 self.led_mode_radio_items[self.backend.led_mode].set_active(True)
             if self.item_led_custom_color:
                 self.item_led_custom_color.set_sensitive(self.backend.led_mode == 2)
 
-            # Macro binding state
             if self.item_macro_bound:
                 self.item_macro_bound.set_active(bool(self.backend.btn4_macro_bound))
 
@@ -535,11 +476,9 @@ class TrayApp:
 
         return True
 
-
 def main():
     TrayApp()
     Gtk.main()
 
 if __name__ == "__main__":
     main()
-
