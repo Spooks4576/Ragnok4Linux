@@ -25,6 +25,13 @@ SPEED_PRESETS = [
     ("Very Fast", 18000),
 ]
 
+POLLING_PRESETS = [
+    ("125 Hz", 125),
+    ("250 Hz", 250),
+    ("500 Hz", 500),
+    ("1000 Hz", 1000),
+]
+
 def ensure_icon():
     if not os.path.exists(ICON_CACHE):
         try:
@@ -46,6 +53,9 @@ class TrayApp:
 
         self.menu = Gtk.Menu()
         self.indicator.set_menu(self.menu)
+
+        self._polling_radio_items = {}  # hz -> Gtk.RadioMenuItem
+
         self._build_menu()
 
         GLib.timeout_add(500, self.refresh)
@@ -55,16 +65,19 @@ class TrayApp:
 
     def _build_menu(self):
         self.menu.foreach(lambda w: self.menu.remove(w))
+        self._polling_radio_items.clear()
 
+        # DPI submenu
         dpi_root = Gtk.MenuItem(label="DPI")
         dpi_menu = Gtk.Menu()
         dpi_root.set_submenu(dpi_menu)
         for name, dpi in SPEED_PRESETS:
             item = Gtk.MenuItem(label=f"{name} ({dpi})")
-            item.connect("activate", lambda _, d=dpi: self.backend.set_dpi_async(d, lambda _: None))
+            item.connect("activate", lambda _, d=dpi: self.backend.set_dpi_async(d, lambda *_: None))
             dpi_menu.append(item)
         self.menu.append(dpi_root)
 
+        # LED submenu
         led_root = Gtk.MenuItem(label="LED")
         led_menu = Gtk.Menu()
         led_root.set_submenu(led_menu)
@@ -79,6 +92,29 @@ class TrayApp:
 
         self.menu.append(led_root)
 
+        # Polling submenu (NEW)
+        poll_root = Gtk.MenuItem(label="Polling Rate")
+        poll_menu = Gtk.Menu()
+        poll_root.set_submenu(poll_menu)
+
+        group = None
+        for label, hz in POLLING_PRESETS:
+            item = Gtk.RadioMenuItem.new_with_label(group, label)
+            group = item.get_group()
+            self._polling_radio_items[hz] = item
+
+            def on_polling_activate(w, rate_hz=hz):
+                # Only react when becoming active
+                if isinstance(w, Gtk.RadioMenuItem) and not w.get_active():
+                    return
+                self.backend.set_polling_rate_async(rate_hz, lambda *_: None)
+
+            item.connect("activate", on_polling_activate)
+            poll_menu.append(item)
+
+        self.menu.append(poll_root)
+
+        # Quit
         self.menu.append(Gtk.SeparatorMenuItem())
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", Gtk.main_quit)
@@ -108,9 +144,9 @@ class TrayApp:
         if dialog.run() == Gtk.ResponseType.OK:
             val = int(scale.get_value())
             if is_brightness:
-                self.backend.set_led_async(val, 0, lambda _: None)   # change brightness only
+                self.backend.set_led_async(val, 0, lambda *_: None)   # brightness only
             else:
-                self.backend.set_led_async(0, val, lambda _: None)   # change speed only
+                self.backend.set_led_async(0, val, lambda *_: None)   # speed only
         dialog.destroy()
 
     # --------------------------------------------------------
@@ -123,6 +159,9 @@ class TrayApp:
             try:
                 self.backend.read_battery()
                 self.backend.read_current_dpi()
+
+                # NEW: try read polling rate (if it fails, we just keep last known)
+                self.backend.read_polling_rate()
             except Exception:
                 self.backend.disconnect()
 
@@ -136,8 +175,11 @@ class TrayApp:
             if self.backend.is_sleeping():
                 self.indicator.set_label("Sleeping", "")
             else:
+                poll = ""
+                if self.backend.polling_hz > 0:
+                    poll = f" @ {self.backend.polling_hz}Hz"
                 self.indicator.set_label(
-                    f"{self.backend.dpi_value} DPI | 🔋 {self.backend.battery_percent}%",
+                    f"{self.backend.dpi_value} DPI{poll} | 🔋 {self.backend.battery_percent}%",
                     ""
                 )
         else:

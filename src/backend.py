@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import glob
 import time
-import errno
 import select
 import threading
 from dataclasses import dataclass
@@ -112,6 +111,15 @@ def cmd_read_flash(addr: int, count: int) -> bytes:
     return pack17(bytes(p))
 
 def cmd_write_0807(addr: int, data: bytes) -> bytes:
+    """
+    Writes command 0x07 with this format:
+      p[0]=0x08, p[1]=0x07
+      p[3..4]=addr
+      p[5]=len(data)+1
+      p[6..]=data
+      next byte = checksum_0x55(data)
+      final byte = checksum_0x55(payload16)
+    """
     count = len(data) + 1
     p = bytearray(16)
     p[0] = 0x08
@@ -128,6 +136,10 @@ def cmd_write_0807(addr: int, data: bytes) -> bytes:
 # Registers
 # ============================================================
 
+# Polling rate is a single byte at 0x0000: interval in ms
+# 0x01=1000Hz, 0x02=500Hz, 0x04=250Hz, 0x08=125Hz
+POLLING_RATE_ADDR = 0x0000
+
 DPI_LEVEL_SELECT_ADDR = 0x0004
 DPI_LEVEL_BASE_ADDR   = 0x000C
 DPI_LEVEL_STRIDE      = 0x0004
@@ -138,6 +150,19 @@ LED_APPLY_ADDR  = 0x00A7
 
 def dpi_to_raw(dpi: int) -> int:
     return max(1, min(255, int(round(dpi / 100))))
+
+def polling_hz_to_ms(hz: int) -> int:
+    mapping = {1000: 1, 500: 2, 250: 4, 125: 8}
+    if hz in mapping:
+        return mapping[hz]
+    # snap to nearest supported
+    candidates = [1000, 500, 250, 125]
+    nearest = min(candidates, key=lambda x: abs(x - hz))
+    return mapping[nearest]
+
+def polling_ms_to_hz(ms: int) -> int:
+    ms = max(1, ms)
+    return int(1000 // ms)
 
 
 # ============================================================
@@ -154,6 +179,8 @@ class Backend(GObject.Object):
 
         self.dpi_value = -1
         self.battery_percent = -1
+        self.polling_hz = -1  # NEW
+
         self.last_rx_time = 0.0
         self._io_gate = threading.RLock()
 
@@ -194,6 +221,8 @@ class Backend(GObject.Object):
     # --------------------------------------------------------
 
     def read_battery(self) -> bool:
+        if not self.dev:
+            return False
         rx = self.dev.transceive_expect(cmd_read_battery(), 0x04, 0.2)
         if not rx:
             return False
@@ -213,7 +242,22 @@ class Backend(GObject.Object):
         self.last_rx_time = time.monotonic()
         return True
 
+    def read_polling_rate(self) -> bool:
+        """
+        Polling rate stored at 0x0000 as interval in milliseconds:
+          1 -> 1000 Hz, 2 -> 500 Hz, 4 -> 250 Hz, 8 -> 125 Hz
+        """
+        b = self.read_flash(POLLING_RATE_ADDR, 1)
+        if not b:
+            return False
+        interval_ms = b[0]
+        self.polling_hz = polling_ms_to_hz(interval_ms)
+        self.last_rx_time = time.monotonic()
+        return True
+
     def read_flash(self, addr: int, count: int) -> Optional[bytes]:
+        if not self.dev:
+            return None
         rx = self.dev.transceive_expect(cmd_read_flash(addr, count), 0x08, 0.3)
         if not rx:
             return None
@@ -226,10 +270,14 @@ class Backend(GObject.Object):
     def set_dpi_async(self, dpi: int, on_done: Callable[[bool], None]):
         def worker():
             try:
+                if not self.dev:
+                    GLib.idle_add(on_done, False)
+                    return
                 raw = dpi_to_raw(dpi)
                 pkt = cmd_write_0807(DPI_LEVEL_BASE_ADDR, bytes([raw, raw, 0x00]))
                 self.dev.transceive_expect(pkt, 0x07, 0.2)
                 self.dpi_value = dpi
+                self.last_rx_time = time.monotonic()
                 GLib.idle_add(on_done, True)
             except Exception:
                 GLib.idle_add(on_done, False)
@@ -238,6 +286,10 @@ class Backend(GObject.Object):
     def set_led_async(self, brightness_1_10: int, speed_1_10: int, on_done: Callable[[bool], None]):
         def worker():
             try:
+                if not self.dev:
+                    GLib.idle_add(on_done, False)
+                    return
+
                 cfg_full = self.read_flash(LED_CONFIG_ADDR, 10)
                 if not cfg_full:
                     raise IOError
@@ -254,10 +306,36 @@ class Backend(GObject.Object):
                 self.dev.transceive_expect(cmd_write_0807(LED_CONFIG_ADDR, bytes(cfg)), 0x07, 0.2)
                 self.dev.transceive_expect(cmd_write_0807(LED_APPLY_ADDR, bytes([0x01])), 0x07, 0.2)
 
+                self.last_rx_time = time.monotonic()
                 GLib.idle_add(on_done, True)
             except Exception:
                 GLib.idle_add(on_done, False)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def set_polling_rate_async(self, hz: int, on_done: Callable[[bool], None]):
+        """
+        Writes polling interval (ms) to 0x0000 via cmd 0x07.
+        hz snaps to {125, 250, 500, 1000}.
+        """
+        def worker():
+            try:
+                if not self.dev:
+                    GLib.idle_add(on_done, False)
+                    return
+
+                interval_ms = polling_hz_to_ms(hz)
+                pkt = cmd_write_0807(POLLING_RATE_ADDR, bytes([interval_ms]))
+                rx = self.dev.transceive_expect(pkt, 0x07, 0.2)
+
+                ok = rx is not None
+                if ok:
+                    self.polling_hz = polling_ms_to_hz(interval_ms)
+                    self.last_rx_time = time.monotonic()
+
+                GLib.idle_add(on_done, ok)
+            except Exception:
+                GLib.idle_add(on_done, False)
+
+        threading.Thread(target=worker, daemon=True).start()
 
