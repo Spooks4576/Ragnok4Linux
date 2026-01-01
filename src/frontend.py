@@ -4,10 +4,12 @@ import urllib.request
 import gi
 
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gio", "2.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("Notify", "0.7")
 
-from gi.repository import Gtk, GLib, Notify
+from gi.repository import Gtk, Gdk, Gio, GLib, Notify
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
 
 from backend import Backend
@@ -38,6 +40,7 @@ LED_MODES = [
     ("Mode 5", 5),
 ]
 
+
 def ensure_icon():
     if not os.path.exists(ICON_CACHE):
         try:
@@ -46,6 +49,53 @@ def ensure_icon():
             return "input-mouse"
     return ICON_CACHE
 
+
+def _is_wayland() -> bool:
+    display = Gdk.Display.get_default()
+    if display is not None:
+        name = display.__class__.__name__.lower()
+        if "wayland" in name:
+            return True
+        if "x11" in name:
+            return False
+    return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+
+
+def _dbus_name_has_owner(bus: Gio.DBusConnection, name: str) -> bool:
+    try:
+        rv = bus.call_sync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            GLib.Variant("(s)", (name,)),
+            GLib.VariantType("(b)"),
+            Gio.DBusCallFlags.NONE,
+            500,
+            None,
+        )
+        return bool(rv.unpack()[0])
+    except Exception:
+        return False
+
+
+def _has_status_notifier_watcher() -> bool:
+    """
+    In theory the watcher is org.freedesktop.StatusNotifierWatcher (spec).
+    In practice many desktops use org.kde.StatusNotifierWatcher too.
+    We check both so we behave well across DEs.
+    """
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception:
+        return False
+
+    return (
+        _dbus_name_has_owner(bus, "org.freedesktop.StatusNotifierWatcher")
+        or _dbus_name_has_owner(bus, "org.kde.StatusNotifierWatcher")
+    )
+
+
 class TrayApp:
     def __init__(self):
         self.backend = Backend()
@@ -53,30 +103,82 @@ class TrayApp:
 
         self._updating_menu = False
 
-        self.indicator = AppIndicator.Indicator.new(
-            APP_ID, ensure_icon(), AppIndicator.IndicatorCategory.HARDWARE
-        )
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-
         self.menu = Gtk.Menu()
-        self.indicator.set_menu(self.menu)
-
-        self.polling_radio_items = {}   
-
-        self.led_mode_radio_items = {}  
+        self.polling_radio_items = {}
+        self.led_mode_radio_items = {}
 
         self.item_led_custom_color = None
-
         self.chk_ripple = None
         self.chk_angle = None
         self.chk_motion = None
-
         self.item_macro_bound = None
+
+        self.window = None
+        self.status_label = None
 
         self._build_menu()
 
+        self.indicator = self._try_create_indicator()
+
+        if _is_wayland() and not _has_status_notifier_watcher():
+            self._build_fallback_window()
+            Notify.Notification.new(
+                "Tray icon unavailable on this Wayland session",
+                "No StatusNotifier/AppIndicator host detected. "
+                "On GNOME you usually need the “AppIndicator and KStatusNotifierItem Support” extension.",
+                None,
+            ).show()
+        elif self.indicator is None:
+            self._build_fallback_window()
+
         GLib.timeout_add(500, self.refresh)
         GLib.timeout_add(2000, self.tick)
+
+    def _try_create_indicator(self):
+        try:
+            indicator = AppIndicator.Indicator.new(
+                APP_ID, ensure_icon(), AppIndicator.IndicatorCategory.HARDWARE
+            )
+            indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            indicator.set_menu(self.menu)
+            return indicator
+        except Exception:
+            return None
+
+    def _build_fallback_window(self):
+        if self.window is not None:
+            return
+
+        self.window = Gtk.Window(title="Ragnok Mouse")
+        self.window.set_default_size(320, 110)
+        self.window.set_border_width(10)
+
+        icon = ensure_icon()
+        if os.path.exists(icon):
+            try:
+                self.window.set_icon_from_file(icon)
+            except Exception:
+                pass
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.window.add(vbox)
+
+        self.status_label = Gtk.Label(label="Starting…")
+        self.status_label.set_xalign(0.0)
+        vbox.pack_start(self.status_label, False, False, 0)
+
+        btn = Gtk.MenuButton(label="Menu")
+        btn.set_popup(self.menu)
+        vbox.pack_start(btn, False, False, 0)
+
+        hint = Gtk.Label(
+            label="(Fallback UI: your desktop may not support tray icons on Wayland.)"
+        )
+        hint.set_xalign(0.0)
+        hint.set_line_wrap(True)
+        vbox.pack_start(hint, False, False, 0)
+
+        self.window.show_all()
 
     def _build_menu(self):
         self.menu.foreach(lambda w: self.menu.remove(w))
@@ -86,7 +188,10 @@ class TrayApp:
         dpi_root.set_submenu(dpi_menu)
         for name, dpi in DPI_PRESETS:
             item = Gtk.MenuItem(label=f"{name} ({dpi})")
-            item.connect("activate", lambda _, d=dpi: self.backend.set_dpi_async(d, lambda *_: None))
+            item.connect(
+                "activate",
+                lambda _, d=dpi: self.backend.set_dpi_async(d, lambda *_: None),
+            )
             dpi_menu.append(item)
         self.menu.append(dpi_root)
 
@@ -98,9 +203,7 @@ class TrayApp:
         polling_menu = Gtk.Menu()
         polling_root.set_submenu(polling_menu)
 
-        group = None
         first = None
-
         for label, hz in POLLING_PRESETS:
             if first is None:
                 it = Gtk.RadioMenuItem.new_with_label(None, label)
@@ -141,9 +244,7 @@ class TrayApp:
         mode_menu = Gtk.Menu()
         mode_root.set_submenu(mode_menu)
 
-        group = None
         first = None
-
         for label, mode in LED_MODES:
             if first is None:
                 it = Gtk.RadioMenuItem.new_with_label(None, label)
@@ -164,11 +265,16 @@ class TrayApp:
         led_menu.append(Gtk.SeparatorMenuItem())
 
         bright = Gtk.MenuItem(label="Brightness…")
-        bright.connect("activate", lambda *_: self._led_slider_dialog("Brightness", is_brightness=True))
+        bright.connect(
+            "activate",
+            lambda *_: self._led_slider_dialog("Brightness", is_brightness=True),
+        )
         led_menu.append(bright)
 
         speed = Gtk.MenuItem(label="Speed…")
-        speed.connect("activate", lambda *_: self._led_slider_dialog("Speed", is_brightness=False))
+        speed.connect(
+            "activate", lambda *_: self._led_slider_dialog("Speed", is_brightness=False)
+        )
         led_menu.append(speed)
 
         self.menu.append(led_root)
@@ -219,7 +325,6 @@ class TrayApp:
         if self._updating_menu:
             return
         if item.get_active():
-
             rgb = None
             if mode == 2:
                 rgb = (self.backend.led_r, self.backend.led_g, self.backend.led_b)
@@ -235,14 +340,17 @@ class TrayApp:
 
     def _led_slider_dialog(self, title: str, is_brightness: bool):
         dialog = Gtk.Dialog(title=title, flags=Gtk.DialogFlags.MODAL)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                           Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OK,
+            Gtk.ResponseType.OK,
+        )
         dialog.set_default_size(320, -1)
 
         scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 10, 1)
         scale.set_digits(0)
         scale.set_hexpand(True)
-
         scale.set_value(self.backend.led_brightness if is_brightness else self.backend.led_speed)
 
         box = dialog.get_content_area()
@@ -260,11 +368,13 @@ class TrayApp:
         dialog.destroy()
 
     def _led_color_dialog(self):
-
         if self.backend.led_mode != 2:
             return
 
-        dialog = Gtk.ColorChooserDialog(title="Select Custom RGB", parent=None)
+        dialog = Gtk.ColorChooserDialog(
+            title="Select Custom RGB",
+            parent=self.window if self.window is not None else None,
+        )
         dialog.set_rgba(self._rgb_to_rgba(self.backend.led_r, self.backend.led_g, self.backend.led_b))
 
         if dialog.run() == Gtk.ResponseType.OK:
@@ -279,11 +389,13 @@ class TrayApp:
     def _macro_program_dialog(self):
         dialog = Gtk.Dialog(
             title="Macro Editor (Button 4)",
-            flags=Gtk.DialogFlags.MODAL
+            flags=Gtk.DialogFlags.MODAL,
         )
         dialog.add_buttons(
-            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-            "Save to Mouse", Gtk.ResponseType.OK
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            "Save to Mouse",
+            Gtk.ResponseType.OK,
         )
         dialog.set_default_size(420, 300)
 
@@ -304,20 +416,15 @@ class TrayApp:
         scroll.set_hexpand(True)
         scroll.set_vexpand(True)
         scroll.add(textview)
-
         box.add(scroll)
 
         timing_grid = Gtk.Grid(column_spacing=10, row_spacing=6)
 
         lbl_press = Gtk.Label(label="Press Delay (ms):", halign=Gtk.Align.START)
-        spin_press = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(20, 0, 5000, 1, 10, 0)
-        )
+        spin_press = Gtk.SpinButton(adjustment=Gtk.Adjustment(20, 0, 5000, 1, 10, 0))
 
         lbl_inter = Gtk.Label(label="Inter-key Delay (ms):", halign=Gtk.Align.START)
-        spin_inter = Gtk.SpinButton(
-            adjustment=Gtk.Adjustment(30, 0, 5000, 1, 10, 0)
-        )
+        spin_inter = Gtk.SpinButton(adjustment=Gtk.Adjustment(30, 0, 5000, 1, 10, 0))
 
         timing_grid.attach(lbl_press, 0, 0, 1, 1)
         timing_grid.attach(spin_press, 1, 0, 1, 1)
@@ -336,9 +443,7 @@ class TrayApp:
             text = buf.get_text(start, end, True)
             char_count = len(text)
             event_count = min(char_count * 2, 70)
-            lbl_status.set_text(
-                f"{char_count} characters ({event_count} / 70 events)"
-            )
+            lbl_status.set_text(f"{char_count} characters ({event_count} / 70 events)")
 
         textview.get_buffer().connect("changed", update_status)
         update_status()
@@ -360,18 +465,13 @@ class TrayApp:
             def done(ok: bool):
                 n = Notify.Notification.new(
                     "Macro",
-                    "Macro programmed successfully"
-                    if ok else "Failed to program macro",
+                    "Macro programmed successfully" if ok else "Failed to program macro",
                     None,
                 )
                 n.show()
 
             if not self.backend.auto_connect():
-                Notify.Notification.new(
-                    "Macro",
-                    "Mouse not connected",
-                    None
-                ).show()
+                Notify.Notification.new("Macro", "Mouse not connected", None).show()
                 dialog.destroy()
                 return
 
@@ -397,13 +497,14 @@ class TrayApp:
 
             def notify():
                 if ok:
-                    msg = f"Name: {self.backend.btn4_macro_name}\n" \
-                          f"Events: {self.backend.btn4_macro_count}\n" \
-                          f"Checksum OK: {self.backend.btn4_macro_checksum_ok}"
+                    msg = (
+                        f"Name: {self.backend.btn4_macro_name}\n"
+                        f"Events: {self.backend.btn4_macro_count}\n"
+                        f"Checksum OK: {self.backend.btn4_macro_checksum_ok}"
+                    )
                 else:
                     msg = "Failed to read macro header."
-                n = Notify.Notification.new("Button 4 Macro Info", msg, None)
-                n.show()
+                Notify.Notification.new("Button 4 Macro Info", msg, None).show()
                 return False
 
             GLib.idle_add(notify)
@@ -411,7 +512,7 @@ class TrayApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _rgb_to_rgba(self, r: int, g: int, b: int):
-        rgba = Gtk.gdk.RGBA()
+        rgba = Gdk.RGBA()
         rgba.red = max(0.0, min(1.0, r / 255.0))
         rgba.green = max(0.0, min(1.0, g / 255.0))
         rgba.blue = max(0.0, min(1.0, b / 255.0))
@@ -437,22 +538,26 @@ class TrayApp:
         return True
 
     def refresh(self):
-
         if self.backend.dev:
             if self.backend.is_sleeping():
-                self.indicator.set_label("Sleeping", "")
+                status = "Sleeping"
             else:
                 dpi = self.backend.dpi_value
                 bat = self.backend.battery_percent
                 pr = self.backend.polling_hz
                 extra = f" | {pr}Hz" if pr > 0 else ""
-                self.indicator.set_label(f"{dpi} DPI{extra} | 🔋 {bat}%", "")
+                status = f"{dpi} DPI{extra} | 🔋 {bat}%"
         else:
-            self.indicator.set_label("Disconnected", "")
+            status = "Disconnected"
+
+        if self.indicator is not None:
+            self.indicator.set_label(status, "")
+
+        if self.status_label is not None:
+            self.status_label.set_text(status)
 
         self._updating_menu = True
         try:
-
             if self.backend.polling_hz in self.polling_radio_items:
                 self.polling_radio_items[self.backend.polling_hz].set_active(True)
 
@@ -470,15 +575,16 @@ class TrayApp:
 
             if self.item_macro_bound:
                 self.item_macro_bound.set_active(bool(self.backend.btn4_macro_bound))
-
         finally:
             self._updating_menu = False
 
         return True
 
+
 def main():
     TrayApp()
     Gtk.main()
+
 
 if __name__ == "__main__":
     main()
